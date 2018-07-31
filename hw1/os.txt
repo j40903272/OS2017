@@ -1,0 +1,17 @@
+sudo apt-get install vim fakeroot build-essential kernel-package libncurses5 libncurses5-dev
+cd /tmp
+wget https://www.kernel.org/pub/linux/kernel/v2.6/longterm/v2.6.32/linux-2.6.32.60.tar.xz
+sudo tar xvf linux-2.6.32.60.tar.xz -C /usr/src
+cd /usr/src/linux-2.6.32.60
+make mrproper
+
+sudo make menuconfig
+sudo make -j4 bzImage
+sudo make modules
+sudo make modules_install
+sudo make install
+sudo vim /etc/default/grub
+	#GRUB_HIDDEN_TIMEOUT=0
+	#GRUB_HIDDEN_TIMEOUT_QUIET=true
+sudo update-grub2
+sudo shutdown -r now
