@@ -1,0 +1,136 @@
+1465 /**
+1466  * filemap_fault - read in file data for page fault handling
+1467  * @vma:        vma in which the fault was taken
+1468  * @vmf:        struct vm_fault containing details of the fault
+1469  *
+1470  * filemap_fault() is invoked via the vma operations vector for a
+1471  * mapped memory region to read in file data during a page fault.
+1472  *
+1473  * The goto's are kind of ugly, but this streamlines the normal case of having
+1474  * it in the page cache, and handles the special cases reasonably without
+1475  * having a lot of duplicated code.
+1476  */
+1477 int filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+1478 {
+1479         int error;
+1480         struct file *file = vma->vm_file;
+1481         struct address_space *mapping = file->f_mapping;
+1482         struct file_ra_state *ra = &file->f_ra;
+1483         struct inode *inode = mapping->host;
+1484         pgoff_t offset = vmf->pgoff;
+1485         struct page *page;
+1486         pgoff_t size;
+1487         int ret = 0;
+1488 
+1489         size = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+1490         if (offset >= size)
+1491                 return VM_FAULT_SIGBUS;
+1492 
+1493         /*
+1494          * Do we have something in the page cache already?
+1495          */
+1496         page = find_get_page(mapping, offset);
+1497         if (likely(page)) {
+1498                 /*
+1499                  * We found the page, so try async readahead before
+1500                  * waiting for the lock.
+1501                  */
+1502                 do_async_mmap_readahead(vma, ra, file, page, offset);
+1503                 lock_page(page);
+1504 
+1505                 /* Did it get truncated? */
+1506                 if (unlikely(page->mapping != mapping)) {
+1507                         unlock_page(page);
+1508                         put_page(page);
+1509                         goto no_cached_page;
+1510                 }
+1511         } else {
+1512                 /* No page in the page cache at all */
+1513                 do_sync_mmap_readahead(vma, ra, file, offset);
+1514                 count_vm_event(PGMAJFAULT);
+1515                 ret = VM_FAULT_MAJOR;
+1516 retry_find:
+1517                 page = find_lock_page(mapping, offset);
+1518                 if (!page)
+1519                         goto no_cached_page;
+1520         }
+1521 
+1522         /*
+1523          * We have a locked page in the page cache, now we need to check
+1524          * that it's up-to-date. If not, it is going to be due to an error.
+1525          */
+1526         if (unlikely(!PageUptodate(page)))
+1527                 goto page_not_uptodate;
+1528 
+1529         /*
+1530          * Found the page and have a reference on it.
+1531          * We must recheck i_size under page lock.
+1532          */
+1533         size = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >> PAGE_CACHE_SHIFT;
+1534         if (unlikely(offset >= size)) {
+1535                 unlock_page(page);
+1536                 page_cache_release(page);
+1537                 return VM_FAULT_SIGBUS;
+1538         }
+1539 
+1540         ra->prev_pos = (loff_t)offset << PAGE_CACHE_SHIFT;
+1541         vmf->page = page;
+1542         return ret | VM_FAULT_LOCKED;
+1543 
+1544 no_cached_page:
+1545         /*
+1546          * We're only likely to ever get here if MADV_RandOM is in
+1547          * effect.
+1548          */
+1549         error = page_cache_read(file, offset);
+1550 
+1551         /*
+1552          * The page we want has now been added to the page cache.
+1553          * In the unlikely event that someone removed it in the
+1554          * meantime, we'll just come back here and read it again.
+1555          */
+1556         if (error >= 0)
+1557                 goto retry_find;
+1558 
+1559         /*
+1560          * An error return from page_cache_read can result if the
+1561          * system is low on memory, or a problem occurs while trying
+1562          * to schedule I/O.
+1563          */
+1564         if (error == -ENOMEM)
+1565                 return VM_FAULT_OOM;
+1566         return VM_FAULT_SIGBUS;
+1567 
+1568 page_not_uptodate:
+1569         /*
+1570          * Umm, take care of errors if the page isn't up-to-date.
+1571          * Try to re-read it _once_. We do this synchronously,
+1572          * because there really aren't any performance issues here
+1573          * and we need to check for errors.
+1574          */
+1575         ClearPageError(page);
+1576         error = mapping->a_ops->readpage(file, page);
+1577         if (!error) {
+1578                 wait_on_page_locked(page);
+1579                 if (!PageUptodate(page))
+1580                         error = -EIO;
+1581         }
+1582         page_cache_release(page);
+1583 
+1584         if (!error || error == AOP_TRUNCATED_PAGE)
+1585                 goto retry_find;
+1586 
+1587         /* Things didn't work out. Return zero to tell the mm layer so. */
+1588         shrink_readahead_size_eio(file, ra);
+1589         return VM_FAULT_SIGBUS;
+1590 }
+
+由 .fault    = filemap_fault, 知道 filemap_fault 是?call back函?，由函?注?知道之后?生
+page fault?，?用到??函?。它先到page cache中找，如果?有在?硬?上?取。把page struct??成
+了一?radix tree，加快了page的查找速度。如果在page cache中找到了，?根据???律?定是否?行
+readahead操作；如果需要?硬??，也要先?定是否?行readahead操作，?????page cache中?取，
+如果?在?有，就只好在page_cache_read()中先alloc page，然后把新分配的page加入page cache的某?
+lru list，?硬??取?据，最后再去page cache中就能找到所需的page了。
+
+alloc page后，kernel?page加到lru中, lru中的page是回收的候?. 其余page要么空?要么正被使用, 不
+能被回收。 
